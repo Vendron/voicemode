@@ -195,6 +195,15 @@ def isolate_home_directory(tmp_path, monkeypatch):
     except Exception:
         pass
     try:
+        # A converse call cancelled mid-recording saves its buffer under
+        # voice_mode.config.AUDIO_DIR (read at call time). Frozen from the
+        # real home at import, so without this every cancel test writes a
+        # wav into the developer's ~/.voicemode/audio.
+        import voice_mode.config as _config_module
+        monkeypatch.setattr(_config_module, "AUDIO_DIR", fake_home / ".voicemode" / "audio")
+    except Exception:
+        pass
+    try:
         # VM-1901 observability-001: same bug class again, closed for the
         # LAST module that had it. voice_mode.voice_profiles.VOICES_DIR is
         # frozen from the real os.path.expanduser("~/.voicemode/voices") at
