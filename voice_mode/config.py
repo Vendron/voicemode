@@ -573,6 +573,15 @@ SAVE_ALL = os.getenv("VOICEMODE_SAVE_ALL", "").lower() in ("true", "1", "yes", "
 SAVE_AUDIO = SAVE_ALL or DEBUG or os.getenv("VOICEMODE_SAVE_AUDIO", "").lower() in ("true", "1", "yes", "on")
 SAVE_TRANSCRIPTIONS = SAVE_ALL or DEBUG or os.getenv("VOICEMODE_SAVE_TRANSCRIPTIONS", "").lower() in ("true", "1", "yes", "on")
 
+# A converse call cancelled while recording (ESC, tool-call cancel) keeps what
+# was recorded: the buffer is written to AUDIO_DIR/YYYY/MM/<ts>_<conv>_cancelled.wav
+# and an "stt_cancelled" line goes to the exchanges log. On by default: this is
+# the user's speech, and without it a cancel discards it.
+SAVE_CANCELLED_AUDIO = os.getenv("VOICEMODE_SAVE_CANCELLED_AUDIO", "true").lower() in ("true", "1", "yes", "on")
+# Also transcribe that recording in the background and write the text to the
+# heard log as a partial (final: false, cancelled: true).
+TRANSCRIBE_CANCELLED = os.getenv("VOICEMODE_TRANSCRIBE_CANCELLED", "false").lower() in ("true", "1", "yes", "on")
+
 # Audio feedback configuration
 AUDIO_FEEDBACK_ENABLED = os.getenv("VOICEMODE_AUDIO_FEEDBACK", "true").lower() in ("true", "1", "yes", "on")
 
