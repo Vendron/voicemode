@@ -93,6 +93,7 @@ from voice_mode.core import (
     get_openai_clients,
     save_debug_file,
     get_debug_filename,
+    get_audio_path,
     play_chime_start,
     play_chime_end,
     play_chime_captured,
@@ -2068,6 +2069,80 @@ class ListenResult:
     audio_path: Optional[str] = None
 
 
+def _transcribe_cancelled_recording(audio_data: np.ndarray, wav_path: str, transport: str) -> None:
+    """Background thread: transcribe a cancelled recording and write the text
+    to the heard log as a partial (``final: false``, ``cancelled: true``).
+
+    Runs on its own event loop, outside the cancelled request, so nothing it
+    awaits can be hit by that request's cancellation.
+    """
+    try:
+        result = asyncio.run(speech_to_text(audio_data, False, None, transport))
+        text = (result or {}).get("text") if isinstance(result, dict) else None
+        if not text:
+            logger.info(f"Cancelled recording had no transcribable speech: {wav_path}")
+            return
+        from voice_mode import heard
+        heard.partial(text, source="converse", final=False, cancelled=True,
+                      audio_file=wav_path, session=heard.caller_session(),
+                      agent=heard.caller_agent())
+        logger.info(f"Cancelled recording transcribed to the heard log: {wav_path}")
+    except Exception as e:
+        logger.error(f"Transcribing cancelled recording {wav_path} failed: {e}")
+
+
+def _save_cancelled_recording(audio_data: np.ndarray, transport: str) -> Optional[str]:
+    """Write the buffer of a recording whose caller was cancelled, and log it.
+
+    Called on the recording thread after it stops, so it never awaits on the
+    cancelled request's event loop. Writes
+    ``AUDIO_DIR/YYYY/MM/<YYYYmmdd_HHMMSS_mmm>_<conversation>_cancelled.wav``
+    and an ``stt_cancelled`` line to the exchanges log, then (behind
+    VOICEMODE_TRANSCRIBE_CANCELLED) starts a background transcription.
+    Returns the wav path, or None when there was nothing to save.
+    """
+    if len(audio_data) == 0:
+        return None
+    now = datetime.now()
+    conversation_logger = get_conversation_logger()
+    conversation_id = conversation_logger.conversation_id or "noconv"
+    filename = f"{now.strftime('%Y%m%d_%H%M%S')}_{now.microsecond // 1000:03d}_{conversation_id}_cancelled.wav"
+    wav_path = get_audio_path(filename, Path(voice_mode.config.AUDIO_DIR), now)
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    write(str(wav_path), SAMPLE_RATE, audio_data)
+    duration_ms = int(len(audio_data) * 1000 / SAMPLE_RATE)
+    conversation_logger.log_utterance(
+        "stt_cancelled", "", str(wav_path), duration_ms,
+        {"transport": transport, "reason": "caller cancelled while recording"},
+    )
+    logger.info(f"💾 Saved cancelled recording ({duration_ms / 1000:.1f}s) to: {wav_path}")
+    if voice_mode.config.TRANSCRIBE_CANCELLED:
+        threading.Thread(
+            target=_transcribe_cancelled_recording,
+            args=(audio_data, str(wav_path), transport),
+            name="voicemode-transcribe-cancelled", daemon=True,
+        ).start()
+    return str(wav_path)
+
+
+def _record_keeping_cancelled_audio(stop_event: threading.Event, transport: str, *record_args):
+    """Run ``record_audio_with_silence_detection`` and, when the caller was
+    cancelled mid-recording (``stop_event`` set by listen_and_transcribe's
+    CancelledError handler), save the captured buffer before returning.
+
+    The cancelled caller never awaits this thread's result, so the save has
+    to happen here: on the thread, after the VAD loop has stopped (~0.1s
+    after the cancel), with nothing awaited on the request's event loop.
+    """
+    audio_data, speech_detected = record_audio_with_silence_detection(*record_args, stop_event)
+    if stop_event.is_set() and voice_mode.config.SAVE_CANCELLED_AUDIO:
+        try:
+            _save_cancelled_recording(audio_data, transport)
+        except Exception as e:
+            logger.error(f"Saving cancelled recording failed: {e}")
+    return audio_data, speech_detected
+
+
 async def listen_and_transcribe(
     control_state,
     *,
@@ -2135,9 +2210,13 @@ async def listen_and_transcribe(
     stop_event = threading.Event()
     try:
         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, stop_event
+            None, _record_keeping_cancelled_audio, stop_event, transport,
+            listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness,
         )
     except asyncio.CancelledError:
+        # The recording thread sees stop_event, stops, and saves what it
+        # captured (_record_keeping_cancelled_audio); the cancel itself is
+        # re-raised at once and never waits on that save.
         stop_event.set()
         raise
     timings['record'] = time.perf_counter() - record_start
